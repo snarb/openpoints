@@ -7,10 +7,10 @@ from ...utils import get_missing_parameters_message, get_unexpected_parameters_m
 from ..build import MODELS, build_model_from_cfg
 from ...loss import build_criterion_from_cfg
 from ...utils import load_checkpoint
-
+from ...utils.math_utils_3shape import rotation_6d_to_matrix
 
 @MODELS.register_module()
-class BaseCls(nn.Module):
+class BaseReg(nn.Module):
     def __init__(self,
                  encoder_args=None,
                  cls_args=None,
@@ -32,53 +32,12 @@ class BaseCls(nn.Module):
         global_feat = self.encoder.forward_cls_feat(data)
         return self.prediction(global_feat)
 
-    def get_loss(self, pred, gt, inputs=None):
-        return self.criterion(pred, gt.long())
-
-    def get_logits_loss(self, data, gt):
-        logits = self.forward(data)
-        return logits, self.criterion(logits, gt.long())
-
+    def get_loss(self, pred, gt):
+        return self.criterion(pred, gt)
 
 @MODELS.register_module()
-class DistillCls(BaseCls):
+class RegHead(nn.Module):
     def __init__(self,
-                 encoder_args=None,
-                 cls_args=None,
-                 distill_args=None,
-                 criterion_args=None,
-                 **kwargs):
-        super().__init__(encoder_args, cls_args, criterion_args)
-        self.distill = encoder_args.get('distill', True)
-        in_channels = self.encoder.distill_channels
-        distill_args.distill_head_args.in_channels = in_channels
-        self.dist_head = build_model_from_cfg(distill_args.distill_head_args)
-        self.dist_model = build_model_from_cfg(distill_args).cuda()
-        load_checkpoint(self.dist_model, distill_args.pretrained_path)
-        self.dist_model.eval()
-
-    def forward(self, p0, f0=None):
-        if hasattr(p0, 'keys'):
-            p0, f0 = p0['pos'], p0['x']
-        if self.distill and self.training:
-            global_feat, distill_feature = self.encoder.forward_cls_feat(p0, f0)
-            return self.prediction(global_feat), self.dist_head(distill_feature)
-        else:
-            global_feat = self.encoder.forward_cls_feat(p0, f0)
-            return self.prediction(global_feat)
-
-    def get_loss(self, pred, gt, inputs):
-        return self.criterion(inputs, pred, gt.long(), self.dist_model)
-
-    def get_logits_loss(self, data, gt):
-        logits, dist_logits = self.forward(data)
-        return logits, self.criterion(data, [logits, dist_logits], gt.long(), self.dist_model)
-
-
-@MODELS.register_module()
-class ClsHead(nn.Module):
-    def __init__(self,
-                 num_classes: int,
                  in_channels: int,
                  mlps: List[int]=[256],
                  norm_args: dict=None,
@@ -90,7 +49,6 @@ class ClsHead(nn.Module):
                  ):
         """A general classification head. supports global pooling and [CLS] token
         Args:
-            num_classes (int): class num
             in_channels (int): input channels size
             mlps (List[int], optional): channel sizes for hidden layers. Defaults to [256].
             norm_args (dict, optional): dict of configuration for normalization. Defaults to None.
@@ -102,6 +60,7 @@ class ClsHead(nn.Module):
         Returns:
             logits: (B, num_classes, N)
         """
+        OUTPUTS_CNT = 6 + 3 # 6 outputs to represent rotation, and 3 for translation
         super().__init__()
         if kwargs:
             logging.warning(f"kwargs: {kwargs} are not used in {__class__.__name__}")
@@ -109,9 +68,9 @@ class ClsHead(nn.Module):
         self.point_dim = point_dim
         in_channels = len(self.global_feat) * in_channels if global_feat is not None else in_channels
         if mlps is not None:
-            mlps = [in_channels] + mlps + [num_classes]
+            mlps = [in_channels] + mlps + [OUTPUTS_CNT]
         else:
-            mlps = [in_channels, num_classes]
+            mlps = [in_channels, OUTPUTS_CNT]
 
         heads = []
         for i in range(len(mlps) - 2):
@@ -133,5 +92,12 @@ class ClsHead(nn.Module):
                 elif preprocess in ['avg', 'mean']:
                     global_feats.append(torch.mean(end_points, dim=self.point_dim, keepdim=False))
             end_points = torch.cat(global_feats, dim=1)
-        logits = self.head(end_points)
-        return logits
+        head_out = self.head(end_points)
+        rotation_6d = rotation_6d_to_matrix(head_out[:, :6])
+        translation = head_out[:, 6:]
+        batch_size = head_out.shape[0]
+        I = torch.eye(4, device=head_out.device, dtype=head_out.dtype)
+        homographies = I.repeat(batch_size, 1, 1)
+        homographies[:, :3, :3] = rotation_6d
+        homographies[:, :3, 3] = translation
+        return homographies
