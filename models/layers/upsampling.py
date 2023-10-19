@@ -4,7 +4,7 @@ from torch.autograd import Function
 import torch
 import torch.nn as nn
 
-from openpoints.cpp.pointnet2_batch import pointnet2_cuda
+#from openpoints.cpp.pointnet2_batch import pointnet2_cuda
 from openpoints.models.layers import create_convblock1d
 
 

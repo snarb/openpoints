@@ -7,8 +7,8 @@ import copy, logging
 import torch
 import torch.nn as nn
 from torch.autograd import Function
-from openpoints.cpp import pointnet2_cuda
-
+#from openpoints.cpp import pointnet2_cuda
+import time
 class KNN(nn.Module):
     def __init__(self, neighbors, transpose_mode=True):
         super(KNN, self).__init__()
@@ -73,13 +73,14 @@ class DilatedKNN(nn.Module):
         return self._dilated(idx)
 
 
-class GroupingOperation(Function):
+class GroupingOperation(torch.jit.ScriptModule):
 
-    @staticmethod
-    @torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
-    def forward(ctx, features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
+    def __init__(self):
+        super(GroupingOperation, self).__init__()
+
+    @torch.jit.script_method
+    def forward(self, features: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
         """
-        :param ctx:
         :param features: (B, C, N) tensor of features to group
         :param idx: (B, npoint, nsample) tensor containing the indicies of features to group with
         :return:
@@ -90,31 +91,18 @@ class GroupingOperation(Function):
 
         B, nfeatures, nsample = idx.size()
         _, C, N = features.size()
-        output = torch.cuda.FloatTensor(B, C, nfeatures, nsample, device=features.device)
+        output = torch.empty(B, C, nfeatures, nsample, device=features.device, dtype=torch.float32)
 
-        pointnet2_cuda.group_points_wrapper(B, C, N, nfeatures, nsample, features, idx, output)
+        torch.ops.my_ops.group_points_wrapper_fast(B, C, N, nfeatures, nsample, features, idx, output)
 
-        ctx.for_backwards = (idx, N)
+        # Note: TorchScript doesn't support custom backward operations
+        # So ctx.for_backwards = (idx, N) is removed
+
         return output
 
-    @staticmethod
-    def backward(ctx, grad_out: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        :param ctx:
-        :param grad_out: (B, C, npoint, nsample) tensor of the gradients of the output from forward
-        :return:
-            grad_features: (B, C, N) gradient of the features
-        """
-        idx, N = ctx.for_backwards
-
-        B, C, npoint, nsample = grad_out.size()
-        grad_features = torch.zeros([B, C, N], dtype=torch.float, device=grad_out.device, requires_grad=True)
-        grad_out_data = grad_out.data.contiguous()
-        pointnet2_cuda.group_points_grad_wrapper(B, C, N, npoint, nsample, grad_out_data, idx, grad_features.data)
-        return grad_features, None
 
 
-grouping_operation = GroupingOperation.apply
+grouping_operation = GroupingOperation
 
 
 def torch_grouping_operation(features, idx):
@@ -155,7 +143,7 @@ class GatherOperation(Function):
         _, C, N = features.size()
         output = torch.cuda.FloatTensor(B, C, npoint, device=features.device)
 
-        pointnet2_cuda.gather_points_wrapper(B, C, N, npoint, features, idx, output)
+        torch.ops.my_ops.gather_points_wrapper(B, C, N, npoint, features, idx, output)
 
         ctx.for_backwards = (idx, C, N)
         return output
@@ -167,32 +155,75 @@ class GatherOperation(Function):
 
         grad_features = torch.zeros([B, C, N], dtype=torch.float, device=grad_out.device, requires_grad=True)
         grad_out_data = grad_out.data.contiguous()
-        pointnet2_cuda.gather_points_grad_wrapper(B, C, N, npoint, grad_out_data, idx, grad_features.data)
+        torch.ops.my_ops.gather_points_grad_wrapper(B, C, N, npoint, grad_out_data, idx, grad_features.data)
         return grad_features, None
 
 
 gather_operation = GatherOperation.apply
 
+def ball_query_radius(new_xyz, xyz, radius, nsample):
+    """
+    Arguments:
+    - new_xyz: (B, M, 3) PyTorch Tensor
+    - xyz: (B, N, 3) PyTorch Tensor
+    - radius: float
+    - nsample: int
 
-class BallQuery(Function):
-    @staticmethod
-    def forward(ctx, radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
+    Returns:
+    - idx: (B, M, nsample) PyTorch Tensor
+    """
+
+    B, M, _ = new_xyz.size()
+    _, N, _ = xyz.size()
+
+    new_xyz = new_xyz.unsqueeze(2)  # (B, M, 1, 3)
+    xyz = xyz.unsqueeze(1)  # (B, 1, N, 3)
+
+    dist2 = ((new_xyz - xyz) ** 2).sum(dim=-1)  # (B, M, N)
+
+    radius2 = radius ** 2
+    mask_within_radius = dist2 < radius2  # (B, M, N)
+
+    idx = torch.zeros((B, M, nsample), dtype=torch.long, device=new_xyz.device)  # (B, M, nsample)
+    cnt = mask_within_radius.sum(dim=-1)  # (B, M)
+
+    arange = torch.arange(0, N, device=new_xyz.device)
+    arange = arange.view(1, 1, -1).expand(B, M, -1)  # (B, M, N)
+
+    idx_within_radius = torch.where(mask_within_radius, arange,
+                                    N + torch.ones((B, M, N), dtype=torch.long, device=new_xyz.device))  # (B, M, N)
+
+    for i in range(B):
+        for j in range(M):
+            idx[i, j, :cnt[i, j].item()] = idx_within_radius[i, j, :cnt[i, j].item()].sort()[0][:nsample]
+
+    return idx
+
+
+class BallQuery(torch.jit.ScriptModule):
+
+    def __init__(self):
+        super(BallQuery, self).__init__()
+
+    @torch.jit.script_method
+    def forward(self, radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
         """
-        :param ctx:
         :param radius: float, radius of the balls
         :param nsample: int, maximum number of features in the balls
         :param xyz: (B, N, 3) xyz coordinates of the features
         :param new_xyz: (B, npoint, 3) centers of the ball query
         :return:
-            idx: (B, npoint, nsample) tensor with the indicies of the features that form the query balls
+            idx: (B, npoint, nsample) tensor with the indices of the features that form the query balls
         """
         assert new_xyz.is_contiguous()
         assert xyz.is_contiguous()
 
         B, N, _ = xyz.size()
         npoint = new_xyz.size(1)
-        idx = torch.cuda.IntTensor(B, npoint, nsample, device=xyz.device).zero_()
-        pointnet2_cuda.ball_query_wrapper(B, N, npoint, radius, nsample, new_xyz, xyz, idx)
+
+        # Use torch.empty instead of direct torch.cuda.IntTensor
+        idx = torch.empty(B, npoint, nsample, dtype=torch.int32, device=xyz.device).zero_()
+        torch.ops.my_ops.BallQueryGpu(B, N, npoint, radius, nsample, new_xyz, xyz, idx)
         return idx
 
     @staticmethod
@@ -200,7 +231,7 @@ class BallQuery(Function):
         return None, None, None, None
 
 
-ball_query = BallQuery.apply
+ball_query = BallQuery
 
 
 class QueryAndGroup(nn.Module):
@@ -232,6 +263,9 @@ class QueryAndGroup(nn.Module):
         self.relative_xyz = relative_xyz
         self.return_only_idx = return_only_idx
 
+        self.q = BallQuery()
+        self.grouping_operation = GroupingOperation()
+
     def forward(self, query_xyz: torch.Tensor, support_xyz: torch.Tensor, features: torch.Tensor = None) -> Tuple[
         torch.Tensor]:
         """
@@ -241,17 +275,18 @@ class QueryAndGroup(nn.Module):
         :return:
             new_features: (B, 3 + C, npoint, nsample)
         """
-        idx = ball_query(self.radius, self.nsample, support_xyz, query_xyz)
+        #self.q = BallQuery()
+        idx = self.q(self.radius, self.nsample, support_xyz, query_xyz)
 
         if self.return_only_idx:
             return idx
         xyz_trans = support_xyz.transpose(1, 2).contiguous()
-        grouped_xyz = grouping_operation(xyz_trans, idx)  # (B, 3, npoint, nsample)
+        grouped_xyz = self.grouping_operation(xyz_trans, idx)  # (B, 3, npoint, nsample)
         if self.relative_xyz:
             grouped_xyz = grouped_xyz - query_xyz.transpose(1, 2).unsqueeze(-1)  # relative position
             if self.normalize_dp:
                 grouped_xyz /= self.radius
-        grouped_features = grouping_operation(features, idx) if features is not None else None
+        grouped_features = self.grouping_operation(features, idx) if features is not None else None
         return grouped_xyz, grouped_features
 
 
@@ -351,6 +386,17 @@ def create_grouper(group_args):
         grouper = GroupAll()
     return grouper
 
+from openpoints.models.layers.subsample import furthest_point_sample, random_sample
+
+def min_graph():
+    B, C, N = 2, 3, 40960
+    device = 'cuda'
+    points = torch.randn([B, N, C], device=device, dtype=torch.float)
+    npoints = 10000
+    idx = furthest_point_sample(points, npoints).to(torch.int64)
+    return idx
+   # query = torch.gather(points, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
+    #return query
 
 if __name__ == "__main__":
     import time
@@ -362,13 +408,13 @@ if __name__ == "__main__":
     print(points.shape, '\n', points)
 
     # --------------- debug downsampling
-    from openpoints.models.layers.layer3d import RandomSample, random_sample, furthest_point_sample
-
+    #from openpoints.models.layers.layer3d import RandomSample, random_sample, furthest_point_sample
+    from openpoints.models.layers.subsample import furthest_point_sample, random_sample
     npoints = 10000
     # rs = RandomSample(num_to_sample=npoints)
     # query, _= rs(points)
     idx = random_sample(points, npoints)
-    # torch gather is faster then operation gather. 
+    # torch gather is faster then operation gather.
     query = torch.gather(points, 1, idx.unsqueeze(-1).expand(-1, -1, 3))
     print(query.shape, '\n', query)
 
@@ -395,7 +441,7 @@ if __name__ == "__main__":
     # # print(neighborhood1.shape, '\n', neighborhood1)
 
     # knngroup = KNNGroup(K)
-    # # KNN Group is faster then above torch indexing when warpped in class.  
+    # # KNN Group is faster then above torch indexing when warpped in class.
     # st = time.time()
     # for _ in range(100):
     #     neighborhood2 = knngroup(query, points)
@@ -409,7 +455,7 @@ if __name__ == "__main__":
 
     st = time.time()
     for _ in range(100):
-        # ball querying is 40 times faster then KNN 
+        # ball querying is 40 times faster then KNN
         features = query_group(query, points)
     print(time.time() - st)
     print(features.shape)

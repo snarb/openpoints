@@ -16,7 +16,7 @@ from torch.utils.data import Dataset
 from torchvision.datasets.utils import extract_archive, check_integrity
 from ..build import DATASETS
 import trimesh
-from openpoints.utils.math_utils_3shape import *
+from openpoints.utils.utils_3shape import *
 
 def farthest_point_sample(point, npoint):
     """
@@ -42,25 +42,30 @@ def farthest_point_sample(point, npoint):
     return point
 
 def get_plane(plane_fname):
-    MEAN_ORIG = np.array([-1.9013895 , 12.77964562, -4.90804974])
-    MEAN_NORMAL = np.array([-0.34115871,  0.84640487,  0.17356184])
+    #MEAN_ORIG = np.array([-1.9013895 , 12.77964562, -4.90804974])
+    #MEAN_NORMAL = np.array([-0.34115871,  0.84640487,  0.17356184])
 
     crimefile = open(plane_fname, 'r')
     line = crimefile.readlines()[0].replace('\n', '')
     data = np.array(line.split(',')).astype(float).reshape(2, 3)
     normals = data[0, :]
     origin = data[1, :]
-    return origin - MEAN_ORIG, normals - MEAN_NORMAL
+    return origin, normals
+    #return origin - MEAN_ORIG, normals - MEAN_NORMAL
 
 def load_data(data_dir, partition):
     # mesh_o = trimesh.load_mesh(r"C:\temp\Segmented\{}.ply".format(fname))
     POINT_CLOUD_SCALE_FACTOR = 16.6
     all_data = []
     all_label = []
+    all_path = []
+    all_normals = []
     for plane_fpath in glob.glob(os.path.join(data_dir, partition, 'planes', '*.txt')):
         origin, normals = get_plane(plane_fpath)
         fname = os.path.splitext(os.path.basename(plane_fpath))[0]
-        mesh = trimesh.load_mesh(os.path.join(data_dir, partition, 'meshes', fname + '.ply'))
+        mesh_path = os.path.join(data_dir, partition, 'meshes', fname + '.ply')
+        all_path.append((mesh_path, plane_fpath))
+        mesh = trimesh.load_mesh(mesh_path)
         point_cloud = np.array(mesh.vertices)
         point_cloud /= POINT_CLOUD_SCALE_FACTOR
         point_cloud = point_cloud.astype(np.float32)
@@ -73,10 +78,11 @@ def load_data(data_dir, partition):
 
         all_data.append(point_cloud)
         all_label.append(T)
+        all_normals.append(normals)
         # if len(all_data) > 100:
         #     break
     all_label = np.stack(all_label, axis=0)
-    return all_data, all_label
+    return all_data, all_label, all_path, all_normals
 
 
 @DATASETS.register_module()
@@ -98,7 +104,7 @@ class PlaneRegression(Dataset):
                  ):
         data_dir = os.path.join(os.getcwd(), data_dir) if data_dir.startswith('.') else data_dir
         self.partition = 'train' if split.lower() == 'train' else 'val'  # val = test
-        self.data, self.label = load_data(data_dir, self.partition)
+        self.data, self.label, self.path, self.normals = load_data(data_dir, self.partition)
         self.num_points = num_points
         logging.info(f'==> sucessfully loaded {self.partition} data')
         self.transform = transform
@@ -108,6 +114,8 @@ class PlaneRegression(Dataset):
 
         #pointcloud = self.data[item][:self.num_points]
         label = self.label[item]
+        mesh_path = self.path[item][0]
+        plane_path = self.path[item][1]
 
         if self.partition == 'train':
             np.random.shuffle(pointcloud)
@@ -118,6 +126,9 @@ class PlaneRegression(Dataset):
             data = self.transform(data)
 
         data['x'] = data['pos']
+        data['mesh_path'] = mesh_path
+        data['plane_path'] = plane_path
+        data['normals'] = self.normals[item]
         return data
 
     def __len__(self):

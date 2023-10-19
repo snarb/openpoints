@@ -4,7 +4,7 @@ Copyright 2022@PointNeXt team
 import logging
 import torch
 import torch.nn as nn
-from openpoints.cpp.chamfer_dist import ChamferDistanceL1
+#from openpoints.cpp.chamfer_dist import ChamferDistanceL1
 from ..build import build_model_from_cfg, MODELS
 
 

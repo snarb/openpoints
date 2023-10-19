@@ -7,7 +7,7 @@ from ...utils import get_missing_parameters_message, get_unexpected_parameters_m
 from ..build import MODELS, build_model_from_cfg
 from ...loss import build_criterion_from_cfg
 from ...utils import load_checkpoint
-from ...utils.math_utils_3shape import rotation_6d_to_matrix
+from ...utils.utils_3shape import rotation_6d_to_matrix
 
 @MODELS.register_module()
 class BaseReg(nn.Module):
@@ -32,8 +32,11 @@ class BaseReg(nn.Module):
         global_feat = self.encoder.forward_cls_feat(data)
         return self.prediction(global_feat)
 
-    def get_loss(self, pred, gt):
-        return self.criterion(pred, gt)
+    def get_loss(self, pred, gt, normals):
+        return self.criterion(pred, gt, normals)
+
+    def get_val_loss(self, pred, gt, normals):
+        return self.criterion(pred, gt, normals, True)
 
 @MODELS.register_module()
 class RegHead(nn.Module):

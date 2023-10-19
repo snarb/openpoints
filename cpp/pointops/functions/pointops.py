@@ -50,24 +50,35 @@ class KNNQuery(Function):
 knnquery = KNNQuery.apply
 
 
-class BallQuery(Function):
-    @staticmethod
-    def forward(ctx, radius, nsample, xyz, new_xyz, offset, new_offset):
+class BallQuery(torch.jit.ScriptModule):
+
+    def __init__(self):
+        super(BallQuery, self).__init__()
+
+    @torch.jit.script_method
+    def forward(self, radius: float, nsample: int, xyz: torch.Tensor,
+                new_xyz: torch.Tensor, offset: torch.Tensor,
+                new_offset: torch.Tensor) -> torch.Tensor:
         """
         input: xyz: (n, 3), new_xyz: (m, 3), offset: (b), new_offset: (b)
-        output: idx: (m, nsample), dist2: (m, nsample)
+        output: idx: (m, nsample)
         """
         if new_xyz is None:
             new_xyz = xyz
+
         assert xyz.is_contiguous() and new_xyz.is_contiguous()
         m = new_xyz.shape[0]
-        idx = torch.cuda.IntTensor(m, nsample).zero_()
+
+        # Use modern tensor creation method
+        idx = torch.zeros(m, nsample, device='cuda', dtype=torch.int32)
+
         pointops_cuda.ballquery_cuda(
             m, radius, nsample, xyz, new_xyz, offset, new_offset, idx)
+
         return idx
 
 
-ballquery = BallQuery.apply
+ballquery = BallQuery
 
 
 class Grouping(Function):
